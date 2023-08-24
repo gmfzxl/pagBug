@@ -1,0 +1,30 @@
+1. pag-render的线程持有锁的问题，我们找腾讯这边进一步确认下。
+main线程，进入到：
+void PAGPlayer::prepare() {
+  LockGuard autoLock(rootLocker); // 请求rootLocker锁
+  prepareInternal();
+  if (pagSurface != nullptr && pagSurface->prepare(renderCache, lastGraphic)) {
+    return;
+  }
+  renderCache->prepareLayers();
+}
+
+2.pag-render线程，根据堆栈，先进入到：PAGPlayer::flush()，然后调用flushInternal， 从堆栈看，已经进入到flushInternal方法执行了。
+bool PAGPlayer::flush() {
+  LockGuard autoLock(rootLocker); // flushInternal已经开始执行，已经先拿到rootLocker锁
+  return flushInternal(nullptr);
+}
+初步结论，pag-render线程事先进入拿到rootLocker锁，接着执行后续流程；但是pag-render线程最终也是处于阻塞状态：
+native: #00 pc 000000000004eb30  /apex/com.android.runtime/lib64/bionic/libc.so (syscall+32) (BuildId: bf5f1ce73f89cca7d6a062eb7877e86a)
+  native: #01 pc 0000000000053518  /apex/com.android.runtime/lib64/bionic/libc.so (__futex_wait_ex(void volatile*, bool, int, bool, timespec const*)+148) (BuildId: bf5f1ce73f89cca7d6a062eb7877e86a)
+  native: #02 pc 00000000000b9924  /apex/com.android.runtime/lib64/bionic/libc.so (pthread_cond_wait+80) (BuildId: bf5f1ce73f89cca7d6a062eb7877e86a)
+  native: #03 pc 0000000000217d10  /data/app/~~1acNFA6UNgiyxX8Ng8MIBw==/com.skyui.voiceassistant-sXc6GxB0ONg3fnJeCdbRUQ==/lib/arm64/libpag.so (???) (BuildId: cd4ab68341f372634220a1af5a0fff348a052e72)
+  native: #04 pc 00000000001c6024  /data/app/~~1acNFA6UNgiyxX8Ng8MIBw==/com.skyui.voiceassistant-sXc6GxB0ONg3fnJeCdbRUQ==/lib/arm64/libpag.so (???) (BuildId: cd4ab68341f372634220a1af5a0fff348a052e72)
+  native: #05 pc 00000000001c38a4  /data/app/~~1acNFA6UNgiyxX8Ng8MIBw==/com.skyui.voiceassistant-sXc6GxB0ONg3fnJeCdbRUQ==/lib/arm64/libpag.so (???) (BuildId: cd4ab68341f372634220a1af5a0fff348a052e72)
+  native: #06 pc 000000000012a310  /data/app/~~1acNFA6UNgiyxX8Ng8MIBw==/com.skyui.voiceassistant-sXc6GxB0ONg3fnJeCdbRUQ==/lib/arm64/libpag.so (???) (BuildId: cd4ab68341f372634220a1af5a0fff348a052e72)
+  native: #07 pc 00000000001370d4  /data/app/~~1acNFA6UNgiyxX8Ng8MIBw==/com.skyui.voiceassistant-sXc6GxB0ONg3fnJeCdbRUQ==/lib/arm64/libpag.so (???) (BuildId: cd4ab68341f372634220a1af5a0fff348a052e72)
+  native: #08 pc 000000000010e654  /data/app/~~1acNFA6UNgiyxX8Ng8MIBw==/com.skyui.voiceassistant-sXc6GxB0ONg3fnJeCdbRUQ==/lib/arm64/libpag.so (???) (BuildId: cd4ab68341f372634220a1af5a0fff348a052e72)
+  native: #09 pc 0000000000134118  /data/app/~~1acNFA6UNgiyxX8Ng8MIBw==/com.skyui.voiceassistant-sXc6GxB0ONg3fnJeCdbRUQ==/lib/arm64/libpag.so (???) (BuildId: cd4ab68341f372634220a1af5a0fff348a052e72)
+  native: #10 pc 000000000009e8f0  /data/app/~~1acNFA6UNgiyxX8Ng8MIBw==/com.skyui.voiceassistant-sXc6GxB0ONg3fnJeCdbRUQ==/lib/arm64/libpag.so (pag::PAGSurface::d
+  
+  所以这里，一是同腾讯确认pag-render持有rootLocker，腾讯加这个锁的同步机制，另外关键还是要看pag-render为何被阻塞住了，这里先从腾讯那边了解PAGSurface::draw方法干了什么，请求了其他什么锁
